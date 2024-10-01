@@ -1,0 +1,540 @@
+---
+title: "5. Statistical analysis and interpretation"
+author: "David Novak"
+
+date: "1 May 2024"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float:
+      collapsed: false
+bibliography: 5_stats_references.bib
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) # change wd from path dir to project dir for all chunks
+figdir <- '5_stats_figures'
+```
+
+## Introduction
+
+Yesterday, we used `FlowSOM::GetFeatures` to extract FlowSOM-derived sample-wise features:
+
+-   metacluster counts and percentages (*ie.* relative abundances)
+
+-   MFIs of state markers within metaclusters
+
+We used 16 **lineage** markers for metaclustering (and abundances). We use 4 **state** markers for the MFIs.
+
+::: {#intro style="background-color: #e8f1ff; padding: 10px;"}
+Today, we will use FlowSOM features to reveal differential expression by genotype.
+
+We will start with **non-parametric statistics** and discuss **multiple testing correction**.
+
+Then, we will use a **parametric model** adapted for cytometry data. This part is based on *diffcyt* [@weber2019].
+:::
+
+## Wilcoxon test
+
+Yesterday, we applied `FlowSOM::GroupStats` to analyse WT vs KO metacluster percentages.
+
+`GroupStats` applies the Wilcoxon rank sum test. The inputs are **metacluster percentages (%MC)** per sample.
+
+::: {#model-parametricity style="background-color: #e8f1ff; padding: 10px;"}
+**Parametric models** **make assumptions** about our data, *eg.* that it follows a normal distribution, or some other distribution.
+
+**Non-parametric models** do not make this assumption.
+:::
+
+<center>![Fig1: Wilcoxon rank sum test](5_stats_figures/5_stats_fig1.png)</center>
+
+`GroupStats` reports Wilcoxon *p*-values.
+
+## Multiple testing correction
+
+`GroupStats` also computes **adjusted *p*-values**. This is to account for applying `wilcox.test` repeatedly, to each MC ($N_{\mathrm{mc}}=25$), increasing false positives.
+
+------------------------------------------------------------------------
+
+Let's compare the FlowSOM-derived abundances by group.
+
+First, we load the required packages and set up the path to our FlowSOM model.
+
+```{r 01-packages, include = FALSE}
+library(FlowSOM)        # clustering
+library(tidyverse)      # working with tabular data and plotting
+library(ggrepel)        # plotting text labels for points
+library(flowCore)       # FCS file interfacing
+suppressPackageStartupMessages(library(ComplexHeatmap)) # heatmap plotting
+FlowSOMdir <- '4_clustering/FlowSOM'
+```
+
+We load the feature matrices.
+
+```{r 02-mc-perc}
+feat      <- readRDS('./4_clustering/FlowSOM/features.RDS')
+mc_counts <- feat$metacluster_counts
+mc_perc   <- feat$metacluster_percentages
+mc_mfi    <- feat$metacluster_MFIs
+samples   <- rownames(mc_perc)
+
+## Ad hoc removal of problematic sample
+samples   <- samples[-1]
+mc_counts <- mc_counts[-1, ]
+mc_perc   <- mc_perc[-1, ]
+mc_mfi    <- mc_mfi[-1, ]
+
+head(mc_perc)
+```
+
+`FlowSOM::GroupStats` requires us to divide our samples into groups. In our case, the group is indicated in the name of each sample (`WT` or `KO` ).
+
+```{r 03-group-stats}
+
+groups  <- list(
+  'WT' = grep(pattern = 'WT', x = samples, value = TRUE), 
+  'KO' = grep(pattern = 'KO', x = samples, value = TRUE)
+) # grep(value = TRUE) returns names of matched samples
+
+stats  <- FlowSOM::GroupStats(features = mc_perc, groups = groups)
+print(stats[,1:5])
+```
+
+`fold changes` indicates how much %MC change for `KO`.
+
+## Volcano plot
+
+Fold change is often reported using a log ($log_{2}$ or $log_{10}$) scale. Similarly, *p*-values can be reported as the $-log_{10}p$ for plotting, so that higher values are attributed to significant results.
+
+This combination of values per statistical test (log-fold change and log-*p* value) can be displayed in a **volcano plot**.
+
+```{r 04-wilcox-volcano}
+mcs <- paste0('MC', seq(from = 1, to = ncol(stats))) # metacluster names
+
+## Collect data needed for plotting
+d_wilc <- data.frame(
+  'Metacluster'  = mcs,
+  'neglog10p'    = stats['-log10 p values', ],
+  'neglog10pAdj' = -log10(stats['adjusted p values', ]),
+  'log10FC'      = stats['log10 fold changes', ]
+)
+
+## Create a volcano plot
+ggplot(
+  data    = d_wilc,
+  mapping = aes(x = log10FC, y = neglog10pAdj)
+) +
+  geom_hline(yintercept = -log10(0.05), col = 'darkblue') +
+  geom_point() +
+  geom_label_repel(mapping = aes(label = Metacluster)) +
+  ggtitle('Differential abundance of metaclusters in KO\nWilcoxon test with BH correction') +
+  xlab(bquote(log[10]*' fold change')) +
+  ylab(bquote(-log[10]*'p'[adj]))
+```
+
+The blue horizontal line for $-log_{10}(0.05)$ indicates that **only points above it reach a *p*-value below** $\alpha$**.**
+
+------------------------------------------------------------------------
+
+## *diffcyt* analysis
+
+Differential expression analyses in cytometry can use **parametric models with more statistical power**. One of the most useful frameworks for this is *diffcyt* [@weber2019]. Two separate analyses are normally conducted: a **differential abundance** (DA) and **differential state** (DS) analysis.
+
+<center>[![Fig2. Summary figure from diffcyt publication.](5_stats_figures/5_stats_fig2.png){width="800"}](https://www.nature.com/articles/s42003-019-0415-5)</center>
+
+In DA, we look at the %MC values. We will apply a tool called *edgeR* [@robinson2009].
+
+In DS, we analyse metacluster-specific MFI shifts in the state markers that we specified earlier. For this, we use simple linear models.
+
+------------------------------------------------------------------------
+
+### Designing an experiment
+
+The set-up of our experiment will be given by a **design matrix** and a **contrast matrix**.
+
+The design matrix expresses which sample-specific factors to consider in our analysis. Additionally, a `group_id` column can be used to specify a design with **paired samples**.
+
+```{r 05-experiment-info}
+response <- 'Genotype'                  # fixed effect
+samples  <- basename(rownames(mc_perc)) # sample filenames (without path)
+
+## Summarise info about experiment
+
+genotypes <- factor(
+    ifelse(grepl('KO', samples), 'KO', 'WT'), # label sample 'WT' or 'KO' based on its name
+    levels = c('WT', 'KO') # WT first, KO second ~ KO is the positive group
+)
+
+experiment_info <- data.frame(
+  'group_id'  = as.factor(1), # group ID same throughout ~ samples unpaired
+  'sample_id' = samples,      # unique sample IDs
+  'Genotype'  = genotypes
+)
+print(experiment_info)
+```
+
+```{r 06-design}
+## Define model formula: outcome (KO-vs-WT) depends on Genotype
+formula <- ~ Genotype
+
+## Create design matrix from model formula and experiment info
+design <- stats::model.matrix(formula, data = experiment_info)
+print(design)
+```
+
+Our contrast matrix will give a 0 or 1 for each column, specifying **comparisons of interest**. Our comparison will be between groups by genotype.
+
+```{r 07-contrast}
+contrast <- matrix(c(0, 1), nrow = 2)
+print(contrast)
+```
+
+------------------------------------------------------------------------
+
+### Differential abundance
+
+In DA testing, *edgeR* computes its own normalisation coefficient for each sample. Therefore, we need to load the matrix of **raw metacluster counts per sample** (not percentages).
+
+```{r 08-da-stats}
+counts           <- t(mc_counts) # diffcyt works with transposed matrix
+colnames(counts) <- basename(colnames(counts)) # use filenames without paths for columns
+perc             <- t(mc_perc)
+colnames(perc)   <- basename(colnames(perc))
+
+samples <- colnames(perc) # all biological samples
+
+norm_factors <- edgeR::calcNormFactors(counts, method = 'TMM')
+
+## Treat metacluster counts as differentially expressed genes
+stats_da <- edgeR::DGEList(counts, norm.factors = norm_factors)
+
+## Fit neg-binomial distributions to each metacluster
+stats_da <- edgeR::estimateDisp(stats_da, design = design)
+
+## Fit a GLM to the data
+stats_da <- edgeR::glmFit(stats_da, design = design)
+
+## Test hypothesis (that coefficients for each group are different)
+stats_da <- edgeR::glmLRT(stats_da, contrast = contrast)
+
+## Get results for each metacluster, with multiple testing correction
+res_da <- edgeR::topTags(stats_da, n = Inf, adjust.method = 'BH', sort.by = 'none')
+res_da <- cbind(
+  'Metacluster' = rownames(res_da$table),
+  res_da$table
+)
+```
+
+Now we can display our results like we did for our Wilcoxon tests. We will label significant results only.
+
+```{r 09-da-volcano}
+## Provide labels for significant hits
+labels <- paste0(res_da$Metacluster)
+labels[res_da$FDR>=0.05] <- NA
+
+## Gather results for plotting
+d_da <- cbind(
+  res_da,
+  '-log10AdjPVal' = -log10(res_da$FDR),
+  'log10FC'       = log10(2^(res_da$logFC)), # convert log2FC to log10FC
+  'Label'         = labels
+)
+
+## Generate volcano plot
+ggplot(d_da, aes(x = .data[['log10FC']], y = .data[['-log10AdjPVal']])) +
+  geom_hline(yintercept = -log10(0.05), col = 'darkblue') +
+  geom_point() +
+  ggrepel::geom_label_repel(
+    aes(label = .data[['Label']])
+  ) +
+  ggtitle('Differential abundance of metaclusters in KO\ndiffcyt-edgeR') +
+  xlab(bquote(log[10]*' fold change')) +
+  ylab(bquote(-log[10]*'p'[adj]))
+```
+
+We can view the abundance values themselves and group them.
+
+```{r 10-da-abundances}
+## Concatenate %MC with sample and genotype labels
+mc_perc_annot <- cbind(
+  'Sample'   = samples,
+  'Genotype' = genotypes,
+  as.data.frame(mc_perc)
+)
+
+## Reorganise the table
+input <- tidyr::pivot_longer(
+  mc_perc_annot,
+  cols         = paste0('%', mcs),
+  names_to     = 'Metacluster',
+  values_to    = 'Abundance',
+  names_ptypes = factor()
+)
+
+## Plot %MC per sample, group and MC
+ggplot(input, aes(x = Genotype, y = Abundance, col = Genotype)) +
+  facet_wrap(~Metacluster, scales = 'free_y') + # divide into subplots by metacluster
+  scale_colour_manual(values = c('darkblue', 'darkred')) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_point(size = 1) +
+  ggtitle('Metacluster abundances')
+```
+
+These relative abundances can be juxtaposed with average lineage marker expression values in each metacluster.
+
+```{r 11-da-heatmaps}
+## Load FlowSOM model and information about markers
+fsom        <- readRDS(file.path(FlowSOMdir, 'fsom.RDS'))
+marker_info <- readRDS(file.path(FlowSOMdir, 'MarkerInfo.RDS'))
+
+## Extract lineage-marker MFIs per marker per metacluster
+mc_mfis     <- FlowSOM::GetMetaclusterMFIs(fsom)[, marker_info$Channel[
+  marker_info$Type=='type']]
+colnames(mc_mfis) <- marker_info$Marker[marker_info$Type=='type']
+rownames(mc_mfis) <- mcs
+
+## Create a heatmap of lineage-marker MFIs per metacluster
+ht_mfis <- ComplexHeatmap::Heatmap(
+  matrix = as.matrix(mc_mfis),
+  name = 'MFI', row_title = '', column_title = '', cluster_columns = FALSE,
+  column_names_side = 'bottom', row_names_side = 'left',
+  column_names_gp = grid::gpar(fontsize = 8),
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+
+## Use metacluster percentages as abundances
+mc_abundances <- mc_perc
+rownames(mc_abundances) <- basename(rownames(mc_abundances)) # use simple file names
+colnames(mc_abundances) <- mcs # use simple metacluster names
+mc_abundances <- t(mc_abundances) # transpose
+
+## Create a heatmap of abundances per metacluster
+ht_abundances <- ComplexHeatmap::Heatmap(
+  matrix = as.matrix(mc_abundances),
+  name   = 'abundance', row_title = '', column_title = '',
+  cluster_columns = FALSE, cluster_rows = FALSE,
+  show_row_names = FALSE, column_names_side = 'bottom',
+  column_order = c(grep('WT', samples), grep('KO', samples)), # order samples by genotype
+  row_order = seq(from = 1, to = length(mcs)), # order MCs by number (ascending)
+  col = circlize::colorRamp2(range(mc_abundances, na.rm = TRUE),
+    c('navy', 'yellow')),
+  column_names_gp = grid::gpar(fontsize = 8),
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+
+## Create a heatmap of log-abundances per metacluster
+ht_log_abundances <- ComplexHeatmap::Heatmap(
+  matrix = as.matrix(log10(mc_abundances+0.0001)),
+  name = '% log10(abundance)', row_title = '', column_title = '',
+  cluster_columns = FALSE, cluster_rows = FALSE,
+  show_row_names = FALSE, column_names_side = 'bottom',
+  column_order = c(grep('WT', samples), grep('KO', samples)),
+  row_order = seq(from = 1, to = length(mcs)),
+  col = circlize::colorRamp2(range(log10(mc_abundances+0.0001), na.rm = TRUE),
+    c('navy', 'yellow')),
+  column_names_gp = grid::gpar(fontsize = 8),
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+
+## Combine the three heatmaps and plot
+ComplexHeatmap::draw(
+  ComplexHeatmap::`+.AdditiveUnit`(
+    ht_mfis,
+    ComplexHeatmap::`+.AdditiveUnit`(ht_abundances, ht_log_abundances)
+), auto_adjust = FALSE)
+```
+
+### Differential state
+
+To capture differences in cell state or activation within our metaclusters, we will work with the `metacluster_MFIs` slot of the FlowSOM-derived features object.
+
+```{r 12-ds-mfis}
+mfi           <- t(mc_mfi) # diffcyt needs transposed matrix
+colnames(mfi) <- basename(colnames(mfi))  # use filenames without paths for columns
+rownames(mfi) <- gsub(
+  ' <.*>$', '', rownames(mfi)
+) # remove channel names from row names (only markers)
+```
+
+We will fit a linear model to our MFI values, using the same design and contrast matrix we used for DA.
+
+```{r 13-ds-stats}
+## Fit a model for each metacluster-marker combination
+stats_ds <- limma::lmFit(mfi, design = design)
+
+## Test hypothesis (that coefficients for each group are different)
+stats_ds <- limma::contrasts.fit(stats_ds, contrasts = contrast)
+
+## Computed moderated statistics (more stable estimates by
+## sharing variance information across MC-marker combinations)
+stats_ds <- limma::eBayes(stats_ds, trend = TRUE)
+
+## Get results for each metacluster-marker test, with multiple testing correction
+res_ds <- limma::topTable(
+  stats_ds,
+  coef          = 1,
+  number        = Inf,
+  adjust.method = 'BH',
+  sort.by       = 'none'
+)
+
+## Compute non-log fold change and log10 fold change
+logfc_to_fc <- function(x) sign(x) * (2^abs(x))
+
+labels <- rownames(res_ds)           # MC-marker combinations
+labels[res_ds$adj.P.Val>=0.05] <- NA # only label significant hits
+
+## Gather results for plotting
+res_ds <- data.frame(
+  'Label'      = labels,
+  'FoldChange' = logfc_to_fc(res_ds$logFC),
+  'log10FC'    = log10(2^(res_ds$logFC)),
+  res_ds
+)
+d_ds <- cbind(
+  res_ds,
+  '-log10AdjPVal' = -log10(res_ds$adj.P.Val)
+)
+
+## Create volcano plot
+ggplot(d_ds, aes(x = .data[['log10FC']], y = .data[['-log10AdjPVal']])) +
+  geom_hline(yintercept = -log10(0.05), col = 'darkblue') +
+  geom_point() +
+  ggrepel::geom_label_repel(
+    aes(label = .data[['Label']])
+  ) +
+  ggtitle('Differential state of metaclusters in KO\ndiffcyt-limma') +
+  xlab(bquote(log[10]*' fold change')) +
+  ylab(bquote(-log[10]*'p'[adj]))
+```
+
+::: {#median-vs-posneg style="background-color: #e8f1ff; padding: 10px;"}
+These results are valid under the **assumption that the *median* signal per marker is relevant**.
+:::
+
+\
+
+It is a good idea to inspect signal distribution for (at least) the top hits identified by our tests.
+
+```{r 14-ds-signals-load}
+## Select a metacluster-marker combination
+mc      <- 25
+marker  <- 'CD103'
+samples <- rownames(mc_perc) # full paths to all samples
+
+## Extract signal for this compartment from each sample
+signals       <- vector(mode = 'list', length = length(samples))
+names(signals) <- basename(samples)
+for (i in seq_along(samples)) {
+  s <- samples[i]
+  message(basename(s), ' (', i, '/', length(samples), ')')
+  
+  ## Load FCS file
+  ff <- flowCore::read.FCS(s)
+  
+  ## Get column index of marker
+  mn      <- flowCore::markernames(ff)
+  col_idx <- names(mn)[grep(marker, mn)]
+  
+  ## Map sample onto FlowSOM
+  fsom_ff <- FlowSOM::NewData(fsom = fsom, input = ff)
+  
+  ## Get row indices of metacluster
+  all_mc_idcs <- FlowSOM::GetMetaclusters(fsom = fsom_ff)
+  row_idcs <- which(all_mc_idcs==mc)
+  
+  ## Get signal and save it
+  signal <- ff@exprs[row_idcs, col_idx]
+  signals[[i]] <- signal
+}
+```
+
+Using this data, we can plot the signal density estimates, not only per group but per each sample.
+
+```{r 14-ds-signals-plot}
+## Get numbers of events per sample
+l <- sapply(signals, length)
+message(
+  'Cell count per sample:\n\t',
+  paste(paste(names(l), ':\t', l), collapse = '\n\t')
+)
+
+## Prepare data for plotting
+d_dens <- data.frame(
+  'Signal'   = unlist(signals),                           # concatenated signal data
+  'Sample'   = as.factor(rep(names(signals), times = l)), # aligned sample names
+  'Genotype' = as.factor(rep(genotypes, times = l))       # aligned genotypes
+)
+
+## Set up a colour legend: blue for WT, red for KO, different
+## transparency for each sample
+colours <- rep(NA, times = length(samples))
+n_wt    <- sum(genotypes=='WT')
+n_ko    <- sum(genotypes=='KO')
+colours[genotypes=='WT'] <- scales::alpha(
+  colour = 'darkblue',
+  alpha = seq(from = 1.0, to = 0.4, length.out = n_wt)
+)
+colours[genotypes=='KO'] <- scales::alpha(
+  colour = 'darkred',
+  alpha = seq(from = 1.0, to = 0.4, length.out = n_ko)
+)
+
+## Plot densities
+ggplot(d_dens, aes(x = Signal, col = Sample)) +
+  scale_colour_manual(values = colours) +
+  geom_density() +
+  ggtitle(paste0('Signal densities of ', marker, ' in metacluster ', mc))
+```
+
+Finally, we will plot the state marker MFI shift heatmaps (for significant hits).
+
+```{r 15-ds-heatmaps}
+## Identify significant hits
+signif        <- rownames(res_ds)[res_ds$adj.P.Val < 0.05]
+mc_state_mfis <- mfi[signif, ]
+
+## Create a heatmap of state-marker MFIs per significant result
+ht_state_mfis <- ComplexHeatmap::Heatmap(
+  matrix = as.matrix(mc_state_mfis),
+  name   = 'abundance', row_title = '', column_title = '',
+  cluster_columns = FALSE, cluster_rows = FALSE,
+  show_row_names = TRUE, column_names_side = 'bottom',
+  column_order = c(grep('WT', samples), grep('KO', samples)), # order samples by genotype
+  col = circlize::colorRamp2(range(mc_state_mfis, na.rm = TRUE),
+    c('navy', 'yellow'))
+)
+
+## Combine the two heatmaps and plot
+ComplexHeatmap::draw(ht_state_mfis)
+```
+
+## Exercise
+
+In differential abundance testing, we compared the results of `FlowSOM::GroupStats` with the parametric testing alternative (*edgeR*). For differential state testing, we haven't done this comparison yet.
+
+Complete the code below to apply the non-parametric `wilcox.test` to metacluster MFIs and report your results in a volcano plot. Are there any significant hits?
+
+**Note.** This can be done by copy-pasting previously used code and modifying it a little!
+
+```{r 16-exercise-ds-wilcox}
+## Extract metacluster MFIs 
+mfis <- feat$metacluster_MFIs
+
+## Make column names shorter
+colnames(mfis) <- gsub(' <.*>$', '', colnames(mfis))
+
+## Compute stats
+# ...
+
+## Prepare data for plotting
+# ...
+
+## Create a volcano plot
+# ...
+```
+
+------------------------------------------------------------------------
+
+For more information on differential expression analyses, you can follow this [diffcyt workflow](https://www.bioconductor.org/packages/devel/bioc/vignettes/diffcyt/inst/doc/diffcyt_workflow.html) vignette. Other relevant tools include *CellCnn* [@arvaniti2017] and *CytoGLMM* [@seiler2021].
